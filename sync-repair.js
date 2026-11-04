@@ -1,322 +1,326 @@
-
 'use strict';
 
 /*
-  IEGH Scribe synchronization repair v3
+  IEGH Scribe Sync Repair v4
 
-  Uses an HTML form POST instead of fetch/sendBeacon.
-  Keeps the existing Google Apps Script JSON doPost format.
-  Requires the existing app.js and Code.gs.
+  - Corrects the saved Apps Script endpoint
+  - Preserves the private API key
+  - Preserves all investigation records
+  - Uses a cross-origin HTML form for uploads
+  - Requires a Google receipt to confirm success
+  - Reports upload failures accurately
 
-  Does not clear localStorage or delete investigations.
+  Works with the existing app.js and Code.gs.
 */
 
-const scribeWait = ms =>
-  new Promise(resolve => setTimeout(resolve, ms));
+(function () {
+  const ENDPOINT = DEFAULT_ENDPOINT;
 
-function scribeTransport(payload) {
-  return new Promise((resolve, reject) => {
-    const requestId = 'scribe_upload_' +
-      Math.random().toString(36).slice(2);
+  // Correct any previously saved or mistyped endpoint.
+  if (config.endpoint !== ENDPOINT) {
+    config.endpoint = ENDPOINT;
+    saveConfig();
+  }
 
-    const iframe = document.createElement('iframe');
-    iframe.name = requestId;
-    iframe.style.display = 'none';
-    iframe.setAttribute('aria-hidden', 'true');
+  let transportError = '';
 
-    const form = document.createElement('form');
-    form.method = 'POST';
-    form.action = config.endpoint;
-    form.target = requestId;
-    form.enctype = 'text/plain';
-    form.acceptCharset = 'UTF-8';
-    form.style.display = 'none';
+  function wait(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
 
-    /*
-      A text/plain form sends:
+  /*
+    The Apps Script backend expects raw JSON in
+    e.postData.contents.
 
-        fieldName=fieldValue
+    A text/plain HTML form normally sends name=value.
+    We construct the name and value so that the complete
+    body is valid JSON, including the inserted equals sign.
+  */
 
-      Construct a JSON object where the inserted "="
-      becomes the value of an unused padding property.
+  function submitForm(payload) {
+    return new Promise((resolve, reject) => {
+      const target = 'scribe_' +
+        crypto.randomUUID().replace(/-/g, '');
 
-      Apps Script can then parse e.postData.contents
-      with JSON.parse, just as before.
-    */
+      const frame = document.createElement('iframe');
+      frame.name = target;
+      frame.style.display = 'none';
+      frame.setAttribute('aria-hidden', 'true');
 
-    const field = document.createElement('input');
-    field.type = 'hidden';
+      const form = document.createElement('form');
+      form.method = 'POST';
+      form.action = ENDPOINT;
+      form.target = target;
+      form.enctype = 'text/plain';
+      form.acceptCharset = 'UTF-8';
+      form.style.display = 'none';
 
-    const json = JSON.stringify(payload);
+      const input = document.createElement('input');
+      input.type = 'hidden';
 
-    if (!json.endsWith('}')) {
-      reject(new Error('Invalid upload payload'));
-      return;
-    }
+      const json = JSON.stringify(payload);
 
-    field.name = json.slice(0, -1) +
-      ',"transportPadding":"';
-
-    field.value = '"}';
-
-    form.appendChild(field);
-
-    let finished = false;
-
-    const cleanup = () => {
-      setTimeout(() => {
-        form.remove();
-        iframe.remove();
-      }, 30000);
-    };
-
-    const finish = (error) => {
-      if (finished) return;
-      finished = true;
-
-      if (error) {
-        cleanup();
-        reject(error);
-      } else {
-        cleanup();
-        resolve('form POST submitted');
+      if (!json.endsWith('}')) {
+        reject(new Error('Could not serialize investigation'));
+        return;
       }
-    };
 
-    document.body.appendChild(iframe);
-    document.body.appendChild(form);
+      input.name =
+        json.slice(0, -1) + ',"transportPadding":"';
 
-    try {
-      form.submit();
+      input.value = '"}';
+
+      form.appendChild(input);
+
+      document.body.appendChild(frame);
+      document.body.appendChild(form);
+
+      let submitted = false;
+
+      try {
+        form.submit();
+        submitted = true;
+      } catch (error) {
+        transportError = String(error.message || error);
+      }
+
+      form.remove();
+
+      // Keep the iframe available while Google processes POST.
+      setTimeout(() => frame.remove(), 60000);
+
+      if (!submitted) {
+        reject(new Error(
+          'Browser could not submit upload: ' + transportError
+        ));
+        return;
+      }
 
       /*
-        Cross-origin iframe contents cannot be read.
-        Submission is NOT proof of success.
-
-        The existing receipt system checks whether
-        Google actually processed the investigation.
+        Submission does not prove Google received it.
+        The separate receipt lookup is authoritative.
       */
 
-      setTimeout(() => finish(null), 1200);
+      resolve();
+    });
+  }
 
-    } catch (error) {
-      finish(error);
-    }
-  });
-}
+  // Replace the original opaque fetch upload.
+  sendUpload = async function (visit, pending) {
+    const payload = {
+      action: 'syncInvestigation',
+      apiKey: config.apiKey,
+      requestId: pending.requestId,
+      receiptToken: pending.receiptToken,
+      investigation: visit
+    };
 
-sendUpload = async function (visit, pending) {
-  const payload = {
-    action: 'syncInvestigation',
-    apiKey: config.apiKey,
-    requestId: pending.requestId,
-    receiptToken: pending.receiptToken,
-    investigation: visit
+    pending.attempted = true;
+    pending.lastAttempt = new Date().toISOString();
+
+    save();
+
+    await submitForm(payload);
   };
 
-  pending.attempted = true;
-  pending.lastAttempt = new Date().toISOString();
+  // Replace the old sync routine with accurate confirmation.
+  syncOne = async function (id, manual = false) {
+    const visit = data.visits.find(v => v.id === id);
 
-  save();
+    if (!visit || !visit.end) return false;
 
-  pending.transport = await scribeTransport(payload);
-
-  save();
-};
-
-syncOne = async function (id, manual = false) {
-  const visit = data.visits.find(v => v.id === id);
-
-  if (!visit || !visit.end) return false;
-
-  if (!config.apiKey || !navigator.onLine) {
-    if (manual) {
-      alert(
-        'Google Drive is not configured or the device is offline. ' +
-        'Your investigation remains saved locally.'
-      );
-    }
-    return false;
-  }
-
-  if (syncing) {
-    if (manual) alert('A sync is already running.');
-    return false;
-  }
-
-  syncing = true;
-
-  const s = ensureSync(visit);
-
-  try {
-    if (s.syncedVersion === s.version) {
+    if (!config.apiKey) {
       if (manual) {
-        alert('This investigation is already confirmed in Google Drive.');
+        alert('Google Drive API key is not configured.');
       }
-      return true;
+      return false;
     }
 
-    const pending = getPending(visit);
-
-    let receipt = null;
-
-    // First check whether an earlier upload succeeded.
-    if (pending.attempted) {
-      try {
-        receipt = await checkReceipt(pending);
-      } catch (_) {
-        // No receipt yet.
+    if (!navigator.onLine) {
+      if (manual) {
+        alert(
+          'Your device is offline. ' +
+          'The investigation remains saved locally.'
+        );
       }
+      return false;
     }
 
-    if (!receipt || !receipt.ok) {
-      s.error = 'Submitting investigation to Google...';
+    if (syncing) {
+      if (manual) {
+        alert('An upload is already running.');
+      }
+      return false;
+    }
 
-      save();
-      render();
+    syncing = true;
 
-      await sendUpload(visit, pending);
+    const s = ensureSync(visit);
 
-      // Wait for Google to process the submission.
-      for (let attempt = 0; attempt < 8; attempt++) {
-        await scribeWait(1500 + attempt * 700);
+    try {
+      if (s.syncedVersion === s.version) {
+        if (manual) {
+          alert(
+            'This investigation is already confirmed in Google Drive.'
+          );
+        }
+        return true;
+      }
 
+      const pending = getPending(visit);
+
+      let receipt = null;
+      let lookupError = '';
+
+      // Check for confirmation from an earlier attempt.
+      if (pending.attempted) {
         try {
           receipt = await checkReceipt(pending);
-
-          if (receipt && receipt.ok) break;
-
-          if (receipt && receipt.error) {
-            throw new Error(receipt.error);
-          }
-
         } catch (error) {
-          if (receipt && receipt.error) {
-            throw error;
+          lookupError = String(error.message || error);
+        }
+      }
+
+      if (!receipt || !receipt.ok) {
+        s.error = 'Submitting investigation to Google...';
+        save();
+        render();
+
+        await sendUpload(visit, pending);
+
+        // Poll for the backend's processing receipt.
+        for (let attempt = 0; attempt < 8; attempt++) {
+          await wait(1800 + attempt * 600);
+
+          try {
+            receipt = await checkReceipt(pending);
+
+            if (receipt && receipt.ok) {
+              break;
+            }
+
+            if (receipt && receipt.error) {
+              lookupError = String(receipt.error);
+            }
+
+          } catch (error) {
+            lookupError = String(error.message || error);
           }
         }
       }
-    }
 
-    if (
-      receipt &&
-      receipt.ok &&
-      receipt.uid === visit.id &&
-      s.version === pending.version
-    ) {
-      s.syncedVersion = s.version;
-      s.docUrl = receipt.docUrl;
-      s.sheetUrl = receipt.sheetUrl;
-      s.error = '';
-      s.pending = null;
+      if (
+        receipt &&
+        receipt.ok &&
+        receipt.uid === visit.id &&
+        s.version === pending.version
+      ) {
+        s.syncedVersion = s.version;
+        s.docUrl = receipt.docUrl;
+        s.sheetUrl = receipt.sheetUrl;
+        s.error = '';
+        s.pending = null;
 
-      notice = 'Google Drive confirmed this investigation.';
+        save();
+
+        notice = 'Google Drive confirmed this investigation.';
+
+        if (manual) alert(notice);
+
+        return true;
+      }
+
+      s.error =
+        'Google did not confirm this upload. ' +
+        'The investigation is safe on this device.' +
+        (lookupError
+          ? ' Receipt check: ' + lookupError
+          : ' No confirmation receipt was returned.');
 
       save();
 
-      if (manual) alert(notice);
+      if (manual) alert(s.error);
 
-      return true;
+      return false;
+
+    } catch (error) {
+      s.error =
+        'Upload error: ' +
+        String(error.message || error);
+
+      save();
+
+      if (manual) alert(s.error);
+
+      return false;
+
+    } finally {
+      syncing = false;
+      render();
+    }
+  };
+
+  // Count only investigations actually confirmed by Google.
+  syncAll = async function (manual = false) {
+    if (!config.apiKey) {
+      if (manual) {
+        alert('Save your private API key first.');
+      }
+      return;
     }
 
-    s.error =
-      'Google has not confirmed this upload. ' +
-      'Check Apps Script Executions for doPost. ' +
-      'Your investigation is still saved on this device.';
-
-    save();
-
-    if (manual) alert(s.error);
-
-    return false;
-
-  } catch (error) {
-    s.error = 'Upload failed: ' +
-      (error && error.message ? error.message : String(error));
-
-    save();
-
-    if (manual) alert(s.error);
-
-    return false;
-
-  } finally {
-    syncing = false;
-    render();
-  }
-};
-
-syncAll = async function (manual = false) {
-  if (!config.apiKey) {
-    if (manual) {
-      alert('Your private Google Drive API key is not saved.');
+    if (!navigator.onLine) {
+      if (manual) {
+        alert('Offline. Your investigations remain saved locally.');
+      }
+      return;
     }
-    return;
-  }
 
-  if (!navigator.onLine) {
-    if (manual) {
-      alert('You are offline. Your records remain saved locally.');
+    if (syncing) {
+      if (manual) {
+        alert('An upload is already running.');
+      }
+      return;
     }
-    return;
-  }
 
-  if (syncing) {
-    if (manual) alert('A sync is already running.');
-    return;
-  }
-
-  const pending = data.visits.filter(v =>
-    v.end &&
-    (!v.sync || v.sync.syncedVersion !== v.sync.version)
-  );
-
-  if (!pending.length) {
-    if (manual) {
-      alert('No completed investigations are waiting to sync.');
-    }
-    return;
-  }
-
-  let confirmed = 0;
-
-  for (const visit of pending) {
-    if (await syncOne(visit.id, false)) {
-      confirmed++;
-    }
-  }
-
-  notice =
-    confirmed + ' of ' + pending.length +
-    ' investigation(s) confirmed to Google Drive.';
-
-  render();
-
-  if (manual) {
-    alert(
-      notice +
-      (confirmed === pending.length
-        ? ''
-        : ' Check the individual report for its upload status.')
+    const visits = data.visits.filter(v =>
+      v.end &&
+      (!v.sync ||
+        v.sync.syncedVersion !== v.sync.version)
     );
-  }
-};
 
-// Improve the status wording without modifying stored data.
+    if (!visits.length) {
+      if (manual) {
+        alert('No investigations are waiting to sync.');
+      }
+      return;
+    }
 
-const scribeOriginalRender = render;
+    let confirmed = 0;
 
-render = function () {
-  scribeOriginalRender();
+    for (const visit of visits) {
+      if (await syncOne(visit.id, false)) {
+        confirmed++;
+      }
+    }
 
-  const localBadge =
-    document.querySelector('body > .row .status');
+    notice =
+      confirmed + ' of ' + visits.length +
+      ' pending investigation(s) confirmed in Google Drive.';
 
-  if (localBadge) {
-    localBadge.textContent = 'DEVICE STORAGE';
-  }
+    render();
 
-  if (view === 'home') {
+    if (manual) {
+      alert(notice);
+    }
+  };
+
+  // Fix the misleading home-screen connection label.
+  const originalRender = render;
+
+  render = function () {
+    originalRender();
+
     const paragraphs =
       document.querySelectorAll('#app p.muted');
 
@@ -328,13 +332,18 @@ render = function () {
       ) {
         p.textContent =
           'Google Drive settings saved. ' +
-          'Uploads require confirmation from Google. ' +
           (navigator.onLine
             ? 'Internet available.'
-            : 'Device offline.');
+            : 'Currently offline.') +
+          ' Uploads require Google confirmation.';
       }
     }
-  }
-};
+  };
 
-render();
+  render();
+
+  console.info(
+    'IEGH Scribe Sync Repair v4 loaded. ' +
+    'Endpoint: ' + ENDPOINT
+  );
+})();
